@@ -1,0 +1,12 @@
+{
+  "browser_backend": {
+    "id": "cdp",
+    "display_name": "Chrome CDP",
+    "tool_names": {
+      "browse_url": "browse_url",
+      "read_page_text": "read_page_text",
+      "click_element": "click_element",
+      "fill_form_field": "fill_form_field"
+    }
+  }
+}

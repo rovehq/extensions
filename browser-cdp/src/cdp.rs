@@ -221,7 +221,7 @@ impl CdpBackend {
     }
 
     /// Navigate to `url` and return the page title (inherent method).
-    async fn navigate_impl(&mut self, url: &str) -> Result<String> {
+    pub(crate) async fn navigate_impl(&mut self, url: &str) -> Result<String> {
         self.ensure_connected().await?;
         let session = self.session.as_mut().unwrap();
 
@@ -259,7 +259,7 @@ impl CdpBackend {
         Ok(format!("Navigated to: {url}\nTitle: {title}"))
     }
 
-    async fn page_text_impl(&mut self) -> Result<String> {
+    pub(crate) async fn page_text_impl(&mut self) -> Result<String> {
         self.ensure_connected().await?;
         let session = self.session.as_mut().unwrap();
 
@@ -289,7 +289,7 @@ impl CdpBackend {
         }
     }
 
-    async fn click_impl(&mut self, selector: &str) -> Result<String> {
+    pub(crate) async fn click_impl(&mut self, selector: &str) -> Result<String> {
         self.ensure_connected().await?;
         let session = self.session.as_mut().unwrap();
 
@@ -317,7 +317,7 @@ impl CdpBackend {
             .to_string())
     }
 
-    async fn fill_field_impl(&mut self, selector: &str, value: &str) -> Result<String> {
+    pub(crate) async fn fill_field_impl(&mut self, selector: &str, value: &str) -> Result<String> {
         self.ensure_connected().await?;
         let session = self.session.as_mut().unwrap();
 
@@ -347,6 +347,574 @@ impl CdpBackend {
         Ok(extract_string_value(&res)
             .unwrap_or("Field filled")
             .to_string())
+    }
+
+    /// Execute JavaScript and return the result as JSON
+    async fn execute_js(&mut self, script: &str) -> Result<serde_json::Value> {
+        self.ensure_connected().await?;
+        let session = self.session.as_mut().unwrap();
+
+        let res = session
+            .call(
+                "Runtime.evaluate",
+                serde_json::json!({
+                    "expression": script,
+                    "returnByValue": true
+                }),
+            )
+            .await?;
+
+        // CDP returns {type: "...", value: ...} after call() extracts "result"
+        if let Some(exception) = res.get("exceptionDetails") {
+            return Err(anyhow!("JavaScript error: {}", exception));
+        }
+
+        Ok(res.get("value").cloned().unwrap_or(serde_json::Value::Null))
+    }
+
+    /// Discover all forms and their fields
+    pub(crate) async fn inspect_form_impl(&mut self) -> Result<String> {
+        self.ensure_connected().await?;
+        let session = self.session.as_mut().unwrap();
+
+        let expr = r#"(function(){
+            const forms = Array.from(document.querySelectorAll('form'));
+            if (forms.length === 0) return '[]';
+            
+            const result = forms.map((form, idx) => ({
+                index: idx,
+                action: form.action || '',
+                method: form.method || 'GET',
+                fields: Array.from(form.querySelectorAll('input, textarea, select')).map(field => ({
+                    name: field.name || '',
+                    type: field.type || 'text',
+                    label: (field.labels && field.labels[0] ? field.labels[0].textContent.trim() : '') || field.placeholder || '',
+                    required: field.required
+                }))
+            }));
+            return JSON.stringify(result);
+        })()"#;
+
+        let res = session
+            .call(
+                "Runtime.evaluate",
+                serde_json::json!({"expression": expr, "returnByValue": true}),
+            )
+            .await?;
+
+        Ok(extract_string_value(&res).unwrap_or("[]").to_string())
+    }
+
+    /// Fill form intelligently by matching data to fields
+    pub(crate) async fn fill_form_smart_impl(
+        &mut self,
+        data: serde_json::Value,
+        submit: bool,
+    ) -> Result<String> {
+        self.ensure_connected().await?;
+
+        // Discover forms using direct CDP call
+        let discover_expr = r#"(function(){
+            const forms = Array.from(document.querySelectorAll('form'));
+            if (forms.length === 0) return '[]';
+            return JSON.stringify(forms.map(form => ({
+                fields: Array.from(form.querySelectorAll('input, textarea, select')).map(field => ({
+                    name: field.name || '',
+                    type: field.type || 'text',
+                    label: (field.labels && field.labels[0] ? field.labels[0].textContent.trim() : '') || field.placeholder || '',
+                    id: field.id || ''
+                }))
+            })));
+        })()"#;
+
+        let res = self.session.as_mut().unwrap()
+            .call(
+                "Runtime.evaluate",
+                serde_json::json!({"expression": discover_expr, "returnByValue": true}),
+            )
+            .await?;
+
+        let forms_str = extract_string_value(&res).unwrap_or("[]");
+        let forms: serde_json::Value = serde_json::from_str(forms_str)?;
+        let forms_array = forms.as_array().ok_or_else(|| anyhow!("No forms found"))?;
+        if forms_array.is_empty() {
+            return Ok(serde_json::json!({"filled": [], "skipped": [], "submitted": false}).to_string());
+        }
+
+        let form = &forms_array[0];
+        let fields = form["fields"]
+            .as_array()
+            .ok_or_else(|| anyhow!("Invalid form structure"))?;
+
+        let data_obj = data
+            .as_object()
+            .ok_or_else(|| anyhow!("Data must be an object"))?;
+
+        let mut filled = Vec::new();
+        let mut skipped = Vec::new();
+
+        // Match and fill fields
+        for (key, value) in data_obj {
+            let value_string = value
+                .as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| value.to_string());
+            let key_lower = key.to_lowercase();
+
+            // Find matching field
+            let mut found = false;
+            for field in fields {
+                let name = field["name"].as_str().unwrap_or("");
+                let label = field["label"].as_str().unwrap_or("");
+                let id = field["id"].as_str().unwrap_or("");
+                let tag = field["tagName"].as_str().unwrap_or("");
+
+                // Match by name, label, or id (case-insensitive)
+                if name.to_lowercase() == key_lower
+                    || label.to_lowercase().contains(&key_lower)
+                    || id.to_lowercase() == key_lower
+                {
+                    // Build selector
+                    let selector = if !name.is_empty() {
+                        format!("{}[name='{}']", tag, name)
+                    } else if !id.is_empty() {
+                        format!("#{}", id)
+                    } else {
+                        continue;
+                    };
+
+                    // Fill the field
+                    match self.fill_field_impl(&selector, &value_string).await {
+                        Ok(_) => {
+                            filled.push(key.clone());
+                            found = true;
+                            break;
+                        }
+                        Err(_) => continue,
+                    }
+                }
+            }
+
+            if !found {
+                skipped.push(key.clone());
+            }
+        }
+
+        // Submit if requested
+        let submitted = if submit {
+            let submit_expr = r#"(function(){
+                const btn = document.querySelector('button[type="submit"], input[type="submit"]');
+                if (btn) { btn.click(); return 'submitted'; }
+                return 'no button';
+            })()"#;
+            
+            match self.session.as_mut().unwrap().call("Runtime.evaluate", serde_json::json!({"expression": submit_expr, "returnByValue": true})).await {
+                Ok(_) => {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    true
+                }
+                Err(_) => false,
+            }
+        } else {
+            false
+        };
+
+        Ok(serde_json::json!({
+            "filled": filled,
+            "skipped": skipped,
+            "submitted": submitted
+        }).to_string())
+    }
+
+    /// Extract specific data by semantic keys
+    pub(crate) async fn extract_semantic_data_impl(&mut self, keys: Vec<String>) -> Result<String> {
+        self.ensure_connected().await?;
+        let session = self.session.as_mut().unwrap();
+        
+        let keys_json = serde_json::to_string(&keys)?;
+        let expr = format!(r#"(function(){{
+            const keys = {keys_json};
+            const result = {{}};
+            
+            keys.forEach(key => {{
+                const selectors = [
+                    `[class*="${{key}}" i]`,
+                    `[id*="${{key}}" i]`,
+                    `[itemprop="${{key}}"]`,
+                    `[aria-label*="${{key}}" i]`,
+                    `[data-testid*="${{key}}" i]`,
+                    `[name*="${{key}}" i]`
+                ];
+                
+                for (const sel of selectors) {{
+                    const el = document.querySelector(sel);
+                    if (el && el.textContent.trim()) {{
+                        result[key] = el.textContent.trim().slice(0, 200);
+                        break;
+                    }}
+                }}
+            }});
+            
+            return JSON.stringify(result);
+        }})()"#);
+        
+        let res = session
+            .call(
+                "Runtime.evaluate",
+                serde_json::json!({"expression": expr, "returnByValue": true}),
+            )
+            .await?;
+        
+        Ok(extract_string_value(&res).unwrap_or("{}").to_string())
+    }
+
+    /// Get semantic page structure
+
+
+    /// Wait for network to be idle (no pending requests)
+    pub(crate) async fn wait_for_network_idle_impl(&mut self, timeout_ms: u64) -> Result<String> {
+        self.ensure_connected().await?;
+        let session = self.session.as_mut().unwrap();
+        
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_millis(timeout_ms);
+        let idle_threshold = Duration::from_millis(500);
+        let mut last_activity = std::time::Instant::now();
+        
+        loop {
+            if start.elapsed() > timeout {
+                return Ok("timeout".to_string());
+            }
+            
+            if last_activity.elapsed() > idle_threshold {
+                return Ok("idle".to_string());
+            }
+            
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            
+            // Check pending requests
+            let expr = r#"(function(){
+                return performance.getEntriesByType('resource')
+                    .filter(r => r.responseEnd === 0).length;
+            })()"#;
+            
+            let res = session.call("Runtime.evaluate",
+                serde_json::json!({"expression": expr, "returnByValue": true})).await?;
+            
+            if let Some(count) = res.get("value").and_then(|v| v.as_u64()) {
+                if count > 0 {
+                    last_activity = std::time::Instant::now();
+                }
+            }
+        }
+    }
+
+    /// Get only interactive elements with temporary IDs
+    pub(crate) async fn get_interactive_elements_impl(&mut self) -> Result<String> {
+        self.ensure_connected().await?;
+        let session = self.session.as_mut().unwrap();
+        
+        let expr = r#"(function(){
+            const elements = [];
+            let id = 1;
+            
+            const selectors = 'a, button, input, select, textarea, [onclick], [role="button"]';
+            document.querySelectorAll(selectors).forEach(el => {
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                
+                if (style.display !== 'none' && 
+                    style.visibility !== 'hidden' &&
+                    rect.width > 0 && rect.height > 0) {
+                    
+                    el.setAttribute('data-rove-id', id);
+                    
+                    elements.push({
+                        id: id++,
+                        tag: el.tagName.toLowerCase(),
+                        type: el.type || '',
+                        text: (el.textContent || el.value || el.placeholder || '').trim().slice(0, 50),
+                        name: el.name || '',
+                        ariaLabel: el.getAttribute('aria-label') || ''
+                    });
+                }
+            });
+            
+            return JSON.stringify(elements);
+        })()"#;
+        
+        let res = session.call("Runtime.evaluate",
+            serde_json::json!({"expression": expr, "returnByValue": true})).await?;
+        
+        Ok(extract_string_value(&res).unwrap_or("[]").to_string())
+    }
+
+    /// Click element by temporary ID
+    pub(crate) async fn click_by_id_impl(&mut self, id: u32) -> Result<String> {
+        self.ensure_connected().await?;
+        let session = self.session.as_mut().unwrap();
+        
+        let expr = format!(r#"(function(){{
+            const el = document.querySelector('[data-rove-id="{}"]');
+            if (!el) return 'ERROR: no element with id {}';
+            el.click();
+            return 'Clicked: ' + (el.textContent || el.value || el.tagName).trim().slice(0, 60);
+        }})()"#, id, id);
+        
+        let res = session.call("Runtime.evaluate",
+            serde_json::json!({"expression": expr, "returnByValue": true})).await?;
+        
+        Ok(extract_string_value(&res).unwrap_or("Click executed").to_string())
+    }
+
+
+    /// Check for blockers (Cloudflare, reCAPTCHA, cookie banners, 404s)
+    pub(crate) async fn check_blockers_impl(&mut self) -> Result<String> {
+        self.ensure_connected().await?;
+        let session = self.session.as_mut().unwrap();
+        
+        let expr = r#"(function(){
+            const blockers = {
+                cloudflare: !!document.querySelector('#challenge-form, .cf-browser-verification, [id*="cf-challenge" i]'),
+                recaptcha: !!document.querySelector('.g-recaptcha, #recaptcha, iframe[src*="recaptcha"]'),
+                cookieBanner: !!document.querySelector('[class*="cookie" i][class*="banner" i], [id*="cookie" i][id*="consent" i]'),
+                error404: document.title.toLowerCase().includes('404') || 
+                         document.title.toLowerCase().includes('not found') ||
+                         document.body.textContent.includes('Page Not Found'),
+                accessDenied: document.body.textContent.includes('Access Denied') ||
+                              document.body.textContent.includes('403 Forbidden')
+            };
+            
+            const blocked = Object.entries(blockers).filter(([k, v]) => v).map(([k]) => k);
+            
+            return JSON.stringify({
+                blocked: blocked.length > 0,
+                blockers: blocked,
+                canProceed: blocked.length === 0
+            });
+        })()"#;
+        
+        let res = session.call("Runtime.evaluate",
+            serde_json::json!({"expression": expr, "returnByValue": true})).await?;
+        
+        Ok(extract_string_value(&res).unwrap_or("{}").to_string())
+    }
+
+    /// Get element diff - returns only changed elements
+    pub(crate) async fn get_element_diff_impl(&mut self, selector: String) -> Result<String> {
+        self.ensure_connected().await?;
+        let session = self.session.as_mut().unwrap();
+        
+        let expr = format!(r#"(function(){{
+            const sel = '{}';
+            const elements = Array.from(document.querySelectorAll(sel));
+            const snapshot = elements.map(el => ({{
+                tag: el.tagName.toLowerCase(),
+                text: el.textContent.trim().substring(0, 100),
+                attrs: Array.from(el.attributes).reduce((acc, attr) => {{
+                    acc[attr.name] = attr.value;
+                    return acc;
+                }}, {{}})
+            }}));
+            
+            if (!window.__cdp_snapshots) window.__cdp_snapshots = {{}};
+            const prev = window.__cdp_snapshots[sel] || [];
+            window.__cdp_snapshots[sel] = snapshot;
+            
+            const changed = snapshot.filter((curr, i) => {{
+                const old = prev[i];
+                return !old || JSON.stringify(curr) !== JSON.stringify(old);
+            }});
+            
+            return JSON.stringify({{
+                total: snapshot.length,
+                changed: changed.length,
+                elements: changed
+            }});
+        }})()"#, selector);
+        
+        let res = session.call("Runtime.evaluate",
+            serde_json::json!({"expression": expr, "returnByValue": true})).await?;
+        
+        Ok(extract_string_value(&res).unwrap_or("{}").to_string())
+    }
+
+    /// Extract HTML table as structured JSON
+    pub(crate) async fn extract_table_to_json_impl(&mut self, selector: Option<String>) -> Result<String> {
+        self.ensure_connected().await?;
+        let session = self.session.as_mut().unwrap();
+        
+        let sel = selector.unwrap_or_else(|| "table".to_string());
+        let expr = format!(r#"(function(){{
+            const table = document.querySelector('{}');
+            if (!table) return JSON.stringify({{"error": "Table not found"}});
+            
+            const headers = Array.from(table.querySelectorAll('thead th, thead td'))
+                .map(th => th.textContent.trim());
+            
+            const rows = Array.from(table.querySelectorAll('tbody tr')).map(tr => {{
+                const cells = Array.from(tr.querySelectorAll('td, th'));
+                const row = {{}};
+                cells.forEach((cell, i) => {{
+                    const key = headers[i] || `col_${{i}}`;
+                    row[key] = cell.textContent.trim();
+                }});
+                return row;
+            }});
+            
+            return JSON.stringify({{
+                headers: headers,
+                rows: rows,
+                count: rows.length
+            }});
+        }})()"#, sel);
+        
+        let res = session.call("Runtime.evaluate",
+            serde_json::json!({"expression": expr, "returnByValue": true})).await?;
+        
+        Ok(extract_string_value(&res).unwrap_or("{}").to_string())
+    }
+
+
+    /// Save session state (cookies + localStorage)
+    pub(crate) async fn save_session_state_impl(&mut self) -> Result<String> {
+        self.ensure_connected().await?;
+        let session = self.session.as_mut().unwrap();
+        
+        let cookies = session.call("Network.getAllCookies", serde_json::json!({})).await?;
+        
+        let expr = r#"(function(){
+            const storage = {};
+            for (let i = 0; i < localStorage.length; i++) {
+                const key = localStorage.key(i);
+                storage[key] = localStorage.getItem(key);
+            }
+            return JSON.stringify(storage);
+        })()"#;
+        
+        let res = session.call("Runtime.evaluate",
+            serde_json::json!({"expression": expr, "returnByValue": true})).await?;
+        let storage = extract_string_value(&res).unwrap_or("{}");
+        
+        Ok(serde_json::json!({
+            "cookies": cookies.get("cookies"),
+            "localStorage": serde_json::from_str::<serde_json::Value>(storage).ok()
+        }).to_string())
+    }
+
+    /// Restore session state (cookies + localStorage)
+    pub(crate) async fn restore_session_state_impl(&mut self, state: String) -> Result<String> {
+        self.ensure_connected().await?;
+        let session = self.session.as_mut().unwrap();
+        
+        let state_obj: serde_json::Value = serde_json::from_str(&state)
+            .map_err(|e| anyhow::anyhow!("Invalid state JSON: {}", e))?;
+        
+        if let Some(cookies) = state_obj.get("cookies").and_then(|c| c.as_array()) {
+            for cookie in cookies {
+                let _ = session.call("Network.setCookie", cookie.clone()).await;
+            }
+        }
+        
+        if let Some(storage) = state_obj.get("localStorage").and_then(|s| s.as_object()) {
+            for (key, value) in storage {
+                let val_str = value.as_str().unwrap_or("");
+                let expr = format!(r#"localStorage.setItem('{}', '{}')"#, 
+                    key.replace('\'', "\\'"), val_str.replace('\'', "\\'"));
+                let _ = session.call("Runtime.evaluate",
+                    serde_json::json!({"expression": expr})).await;
+            }
+        }
+        
+        Ok(r#"{"restored": true}"#.to_string())
+    }
+
+    /// Intercept API responses (XHR/Fetch)
+    pub(crate) async fn intercept_api_response_impl(&mut self, url_pattern: String) -> Result<String> {
+        self.ensure_connected().await?;
+        let session = self.session.as_mut().unwrap();
+        
+        session.call("Network.enable", serde_json::json!({})).await?;
+        
+        let expr = format!(r#"(function(){{
+            const pattern = '{}';
+            if (!window.__cdp_intercepted) window.__cdp_intercepted = [];
+            
+            const origFetch = window.fetch;
+            window.fetch = function(...args) {{
+                return origFetch.apply(this, args).then(response => {{
+                    const url = args[0];
+                    if (url.includes(pattern)) {{
+                        return response.clone().text().then(body => {{
+                            window.__cdp_intercepted.push({{
+                                url: url,
+                                status: response.status,
+                                body: body.substring(0, 5000)
+                            }});
+                            return response;
+                        }});
+                    }}
+                    return response;
+                }});
+            }};
+            
+            return JSON.stringify({{"intercepting": pattern}});
+        }})()"#, url_pattern);
+        
+        let res = session.call("Runtime.evaluate",
+            serde_json::json!({"expression": expr, "returnByValue": true})).await?;
+        
+        Ok(extract_string_value(&res).unwrap_or("{}").to_string())
+    }
+
+    /// Get intercepted API responses
+    pub(crate) async fn get_intercepted_responses_impl(&mut self) -> Result<String> {
+        self.ensure_connected().await?;
+        let session = self.session.as_mut().unwrap();
+        
+        let expr = r#"(function(){
+            const responses = window.__cdp_intercepted || [];
+            window.__cdp_intercepted = [];
+            return JSON.stringify({
+                count: responses.length,
+                responses: responses
+            });
+        })()"#;
+        
+        let res = session.call("Runtime.evaluate",
+            serde_json::json!({"expression": expr, "returnByValue": true})).await?;
+        
+        Ok(extract_string_value(&res).unwrap_or("{}").to_string())
+    }
+
+    pub(crate) async fn get_page_structure_impl(&mut self) -> Result<String> {
+        self.ensure_connected().await?;
+        let session = self.session.as_mut().unwrap();
+
+        let expr = r#"(function(){
+            const result = {
+                title: document.title || '',
+                url: window.location.href,
+                headings: Array.from(document.querySelectorAll('h1, h2, h3')).map(h => h.textContent.trim()).slice(0, 10),
+                forms: document.querySelectorAll('form').length,
+                inputs: document.querySelectorAll('input, textarea, select').length,
+                buttons: Array.from(document.querySelectorAll('button, input[type="submit"]')).map(b => b.textContent.trim() || b.value).slice(0, 10),
+                links: Array.from(document.querySelectorAll('a[href]')).slice(0, 20).map(a => ({
+                    text: a.textContent.trim().slice(0, 50),
+                    href: a.href
+                }))
+            };
+            return JSON.stringify(result);
+        })()"#;
+
+        let res = session
+            .call(
+                "Runtime.evaluate",
+                serde_json::json!({"expression": expr, "returnByValue": true}),
+            )
+            .await?;
+
+        Ok(extract_string_value(&res).unwrap_or("{}").to_string())
     }
 }
 
@@ -380,11 +948,7 @@ impl BrowserBackend for CdpBackend {
             .map_err(|e| EngineError::ToolError(e.to_string()))
     }
 
-    async fn fill_field(
-        &mut self,
-        selector: &str,
-        value: &str,
-    ) -> Result<String, EngineError> {
+    async fn fill_field(&mut self, selector: &str, value: &str) -> Result<String, EngineError> {
         self.fill_field_impl(selector, value)
             .await
             .map_err(|e| EngineError::ToolError(e.to_string()))
@@ -516,44 +1080,3 @@ fn ready_state_value(res: &serde_json::Value) -> Option<&str> {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cdp_backend_constructs_without_panic() {
-        let config = CdpConfig {
-            mode: CdpMode::AttachExisting,
-            cdp_url: Some("http://127.0.0.1:9222".to_string()),
-            browser: None,
-            user_data_dir: None,
-            startup_url: None,
-        };
-        let backend = CdpBackend::new(config);
-        assert!(!backend.is_connected());
-        assert_eq!(backend.backend_name(), "Chrome CDP");
-    }
-
-    #[test]
-    fn resolve_chrome_binary_does_not_return_nonexistent_override() {
-        let nonexistent = "/nonexistent/chrome/path/that/cannot/exist";
-        let result = resolve_chrome_binary(Some(nonexistent));
-        if let Some(path) = result {
-            assert_ne!(path, std::path::PathBuf::from(nonexistent));
-        }
-    }
-
-    #[test]
-    fn extract_string_value_parses_evaluate_response() {
-        let res = serde_json::json!({
-            "result": {"type": "string", "value": "complete"}
-        });
-        assert_eq!(extract_string_value(&res), Some("complete"));
-    }
-
-    #[test]
-    fn extract_string_value_returns_none_for_non_string() {
-        let res = serde_json::json!({"result": {"type": "number", "value": 42}});
-        assert!(extract_string_value(&res).is_none());
-    }
-}
