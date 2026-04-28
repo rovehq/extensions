@@ -49,6 +49,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Checkout core (sdk path dependency)
+        run: |
+          git clone --depth 1 https://github.com/rovehq/core.git ../core
+
       - name: Install tools
         run: |
           cargo install wasm-tools 2>/dev/null || true
