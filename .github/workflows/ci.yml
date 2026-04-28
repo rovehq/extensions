@@ -71,13 +71,13 @@ jobs:
             plugin_name=$(basename "$plugin_dir" | tr -d '/')
 
             echo "=== Building: $plugin_name ==="
-            if ! (cd "$plugin_dir" && cargo build --target wasm32-wasip1 --release 2>&1); then
+            wasm_name=$(echo "$plugin_name" | tr '-' '_')
+            if ! cargo build -p "$plugin_name" --target wasm32-wasip1 --release 2>&1; then
               echo "  SKIP: wasm build failed for $plugin_name (native-only plugin?)"
               continue
             fi
 
-            wasm_name=$(echo "$plugin_name" | tr '-' '_')
-            wasm_src="${plugin_dir}target/wasm32-wasip1/release/${wasm_name}.wasm"
+            wasm_src="target/wasm32-wasip1/release/${wasm_name}.wasm"
             [ ! -f "$wasm_src" ] && echo "  WARN: no wasm, skipping" && continue
 
             wasm-tools validate "$wasm_src" || true
