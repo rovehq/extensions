@@ -4,12 +4,14 @@
   "version": "1.0.0",
   "description": "Read, write, and delete files inside the Rove workspace.",
   "author": "Rove Team",
-  "trust_tier": 1,
-  "plugin": {
-    "wasm_file": "fs_editor.wasm",
-    "allowed_hosts": [],
-    "allowed_imports": ["extism:host/env"],
-    "requires_network": false
+  "plugin_type": "Workspace",
+  "trust_tier": "Official",
+  "permissions": {
+    "filesystem": ["read", "write"],
+    "network": [],
+    "memory_read": false,
+    "memory_write": false,
+    "tools": []
   },
   "tools": [
     {

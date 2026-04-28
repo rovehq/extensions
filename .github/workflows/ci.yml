@@ -123,8 +123,8 @@ jobs:
         env:
           CHANNEL: ${{ needs.resolve-channel.outputs.channel }}
         run: |
-          mkdir -p ".r2_upload/${CHANNEL}/plugins"
-          cp -r artifacts/registry/. ".r2_upload/${CHANNEL}/plugins/"
+          mkdir -p ".r2_upload/${CHANNEL}/extensions"
+          cp -r artifacts/registry/. ".r2_upload/${CHANNEL}/extensions/"
           find .r2_upload -type f | sort
 
       - name: Deploy to Cloudflare R2
@@ -164,8 +164,8 @@ jobs:
           set -e
           git clone https://x-access-token:${REGISTRY_PAT}@github.com/rovehq/registry.git /tmp/registry
           COMMIT=$(git rev-parse --short HEAD)
-          mkdir -p "/tmp/registry/${CHANNEL}/plugins"
-          cp -r artifacts/registry/. "/tmp/registry/${CHANNEL}/plugins/"
+          mkdir -p "/tmp/registry/${CHANNEL}/extensions"
+          cp -r artifacts/registry/. "/tmp/registry/${CHANNEL}/extensions/"
           cd /tmp/registry
           git config user.name "rove-ci"
           git config user.email "ci@roveai.co"
