@@ -252,17 +252,20 @@ jobs:
 
           find .r2_upload -type f | sort
 
+      - name: Install awscli
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq awscli
+
       - name: Deploy to Cloudflare R2
-        uses: jakejarvis/s3-sync-action@master
-        with:
-          args: --acl public-read --follow-symlinks
         env:
-          AWS_S3_BUCKET: ${{ secrets.REGISTRY_R2_BUCKET_NAME }}
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_REGION: "auto"
-          AWS_S3_ENDPOINT: ${{ secrets.R2_API_URL }}
-          SOURCE_DIR: ".r2_upload"
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: ${{ secrets.R2_API_URL }}
+          R2_BUCKET: ${{ secrets.REGISTRY_R2_BUCKET_NAME }}
+        run: |
+          aws s3 sync .r2_upload/ "s3://${R2_BUCKET}/" \
+            --endpoint-url "${R2_ENDPOINT}" \
+            --acl public-read --follow-symlinks
 
   # ── Update registry repo ─────────────────────────────
   update-registry:
