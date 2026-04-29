@@ -1,0 +1,41 @@
+{
+  "id": "voice-native",
+  "name": "Voice (Native)",
+  "version": "0.0.3",
+  "sdk_version": "0.1.0",
+  "description": "OS-native audio device listing and speech synthesis (say on macOS, spd-say/espeak on Linux, PowerShell SpeechSynthesizer on Windows).",
+  "author": "Rove HQ",
+  "plugin_type": "Native",
+  "trust_tier": "Official",
+  "native_tool_entry": true,
+  "permissions": {
+    "filesystem": [],
+    "network": [],
+    "memory_read": false,
+    "memory_write": false,
+    "tools": []
+  },
+  "tools": [
+    {
+      "name": "list_devices",
+      "description": "List available audio input and output devices.",
+      "parameters": {},
+      "risk_tier": 0
+    },
+    {
+      "name": "test_output",
+      "description": "Speak text through the system default audio output.",
+      "parameters": {
+        "text": "String",
+        "voice": "String"
+      },
+      "risk_tier": 0
+    },
+    {
+      "name": "test_input",
+      "description": "Test microphone capture (not yet implemented).",
+      "parameters": {},
+      "risk_tier": 0
+    }
+  ]
+}

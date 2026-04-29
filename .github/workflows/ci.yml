@@ -5,14 +5,20 @@ on:
     branches: [main]
     tags: ["v*"]
     paths:
-      - "**/*.rs"
-      - "**/Cargo.toml"
+      - "plugins/**"
+      - "native/**"
+      - "channels/**"
+      - "scripts/**"
+      - "Cargo.toml"
       - "Cargo.lock"
   pull_request:
     branches: [main]
     paths:
-      - "**/*.rs"
-      - "**/Cargo.toml"
+      - "plugins/**"
+      - "native/**"
+      - "channels/**"
+      - "scripts/**"
+      - "Cargo.toml"
       - "Cargo.lock"
   schedule:
     - cron: "0 22 * * *"
@@ -22,12 +28,17 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  resolve-channel:
-    name: Resolve Channel
+  # ── Detect which extensions changed ────────────────
+  changes:
+    name: Detect Changes
     runs-on: ubuntu-latest
     outputs:
       channel: ${{ steps.channel.outputs.channel }}
+      wasm_plugins: ${{ steps.filter.outputs.wasm_plugins }}
+      native_extensions: ${{ steps.filter.outputs.native_extensions }}
     steps:
+      - uses: actions/checkout@v4
+
       - id: channel
         run: |
           if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
@@ -36,9 +47,24 @@ jobs:
             echo "channel=dev" >> "$GITHUB_OUTPUT"
           fi
 
-  build:
-    name: Build & Sign Official Extensions (${{ needs.resolve-channel.outputs.channel }})
-    needs: [resolve-channel]
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            wasm_plugins:
+              - 'plugins/**'
+              - 'channels/**'
+            native_extensions:
+              - 'native/**'
+
+  # ── Build wasm plugins (ubuntu only) ───────────────
+  build-wasm:
+    name: Build Wasm Plugins (${{ needs.changes.outputs.channel }})
+    needs: [changes]
+    if: |
+      needs.changes.outputs.wasm_plugins == 'true' ||
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -50,36 +76,35 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Checkout core (sdk path dependency)
-        run: |
-          git clone --depth 1 https://github.com/rovehq/core.git ../core
+        run: git clone --depth 1 https://github.com/rovehq/core.git ../core
 
       - name: Install tools
         run: |
           cargo install wasm-tools 2>/dev/null || true
           sudo apt-get update -qq && sudo apt-get install -y -qq openssl 2>/dev/null || true
 
-      - name: Build, sign & bundle each extension
+      - name: Build, sign & bundle wasm plugins
         env:
           OFFICIAL_PRIV: ${{ secrets.ROVE_TEAM_OFFICIAL_PRIVATE_KEY }}
         run: |
           set -e
           mkdir -p artifacts/registry
 
-          for plugin_dir in plugins/*/ native/*/ channels/*/; do
+          for plugin_dir in plugins/*/ channels/*/; do
             [ ! -d "$plugin_dir" ] && continue
             [ ! -f "${plugin_dir}Cargo.toml" ] && continue
             [ ! -f "${plugin_dir}manifest.json" ] && continue
             plugin_name=$(basename "$plugin_dir" | tr -d '/')
 
-            echo "=== Building: $plugin_name ==="
+            echo "=== Building wasm: $plugin_name ==="
             wasm_name=$(echo "$plugin_name" | tr '-' '_')
             if ! cargo build -p "$plugin_name" --target wasm32-wasip1 --release 2>&1; then
-              echo "  SKIP: wasm build failed for $plugin_name (native-only plugin?)"
+              echo "  SKIP: wasm build failed for $plugin_name"
               continue
             fi
 
             wasm_src="target/wasm32-wasip1/release/${wasm_name}.wasm"
-            [ ! -f "$wasm_src" ] && echo "  WARN: no wasm, skipping" && continue
+            [ ! -f "$wasm_src" ] && echo "  WARN: no wasm output, skipping" && continue
 
             wasm-tools validate "$wasm_src" || true
 
@@ -99,33 +124,132 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: extensions-${{ needs.resolve-channel.outputs.channel }}
+          name: wasm-${{ needs.changes.outputs.channel }}
           path: artifacts/
           retention-days: 1
 
-  deploy:
-    name: Deploy to R2 (${{ needs.resolve-channel.outputs.channel }})
-    needs: [resolve-channel, build]
+  # ── Build native extensions (multi-platform cdylib) ─
+  build-native:
+    name: Build Native (${{ needs.changes.outputs.channel }} · ${{ matrix.platform }})
+    needs: [changes]
     if: |
-      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-      startsWith(github.ref, 'refs/tags/v') ||
+      needs.changes.outputs.native_extensions == 'true' ||
       github.event_name == 'schedule' ||
       github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform: linux-x86_64
+            lib_prefix: lib
+            lib_ext: so
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            platform: darwin-aarch64
+            lib_prefix: lib
+            lib_ext: dylib
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: windows-x86_64
+            lib_prefix: ""
+            lib_ext: dll
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: native-${{ matrix.target }}-${{ needs.changes.outputs.channel }}
+
+      - name: Checkout core (sdk path dependency)
+        run: git clone --depth 1 https://github.com/rovehq/core.git ../core
+        shell: bash
+
+      - name: Build native extensions
+        shell: bash
+        run: |
+          set -e
+          mkdir -p artifacts/native/${{ matrix.platform }}
+
+          for ext_dir in native/*/; do
+            [ ! -d "$ext_dir" ] && continue
+            [ ! -f "${ext_dir}Cargo.toml" ] && continue
+            [ ! -f "${ext_dir}manifest.json" ] && continue
+            ext_name=$(basename "$ext_dir" | tr -d '/')
+            lib_name=$(echo "$ext_name" | tr '-' '_')
+
+            echo "=== Building native: $ext_name ==="
+            if ! cargo build -p "$ext_name" --target ${{ matrix.target }} --release 2>&1; then
+              echo "  SKIP: build failed for $ext_name"
+              continue
+            fi
+
+            src="target/${{ matrix.target }}/release/${{ matrix.lib_prefix }}${lib_name}.${{ matrix.lib_ext }}"
+            if [ -f "$src" ]; then
+              cp "$src" "artifacts/native/${{ matrix.platform }}/"
+              cp "${ext_dir}manifest.json" "artifacts/native/${{ matrix.platform }}/${ext_name}.manifest.json"
+              echo "  staged: $(basename $src)"
+            else
+              echo "  WARN: no artifact at $src"
+            fi
+          done
+
+          find artifacts/ -type f | sort
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ needs.changes.outputs.channel }}-${{ matrix.platform }}
+          path: artifacts/
+          retention-days: 1
+
+  # ── Deploy to R2 ────────────────────────────────────
+  deploy:
+    name: Deploy to R2 (${{ needs.changes.outputs.channel }})
+    needs: [changes, build-wasm, build-native]
+    if: |
+      always() &&
+      (needs.build-wasm.result == 'success' || needs.build-wasm.result == 'skipped') &&
+      (needs.build-native.result == 'success' || needs.build-native.result == 'skipped') &&
+      (needs.build-wasm.result != 'cancelled' && needs.build-native.result != 'cancelled') &&
+      (
+        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+        startsWith(github.ref, 'refs/tags/v') ||
+        github.event_name == 'schedule' ||
+        github.event_name == 'workflow_dispatch'
+      )
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/download-artifact@v4
         with:
-          name: extensions-${{ needs.resolve-channel.outputs.channel }}
           path: artifacts/
+          merge-multiple: true
 
       - name: Prepare R2 layout
         env:
-          CHANNEL: ${{ needs.resolve-channel.outputs.channel }}
+          CHANNEL: ${{ needs.changes.outputs.channel }}
         run: |
           mkdir -p ".r2_upload/${CHANNEL}/extensions"
-          cp -r artifacts/registry/. ".r2_upload/${CHANNEL}/extensions/"
+          mkdir -p ".r2_upload/${CHANNEL}/native"
+
+          # Wasm registry bundles
+          if [ -d "artifacts/registry" ]; then
+            cp -r artifacts/registry/. ".r2_upload/${CHANNEL}/extensions/"
+          fi
+
+          # Native dylibs per platform
+          if [ -d "artifacts/native" ]; then
+            cp -r artifacts/native/. ".r2_upload/${CHANNEL}/native/"
+          fi
+
           find .r2_upload -type f | sort
 
       - name: Deploy to Cloudflare R2
@@ -140,33 +264,51 @@ jobs:
           AWS_S3_ENDPOINT: ${{ secrets.R2_API_URL }}
           SOURCE_DIR: ".r2_upload"
 
+  # ── Update registry repo ─────────────────────────────
   update-registry:
-    name: Update Registry Repo (${{ needs.resolve-channel.outputs.channel }})
-    needs: [resolve-channel, build]
+    name: Update Registry Repo (${{ needs.changes.outputs.channel }})
+    needs: [changes, build-wasm, build-native]
     if: |
-      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-      startsWith(github.ref, 'refs/tags/v') ||
-      github.event_name == 'schedule' ||
-      github.event_name == 'workflow_dispatch'
+      always() &&
+      (needs.build-wasm.result == 'success' || needs.build-wasm.result == 'skipped') &&
+      (needs.build-native.result == 'success' || needs.build-native.result == 'skipped') &&
+      (needs.build-wasm.result != 'cancelled' && needs.build-native.result != 'cancelled') &&
+      (
+        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+        startsWith(github.ref, 'refs/tags/v') ||
+        github.event_name == 'schedule' ||
+        github.event_name == 'workflow_dispatch'
+      )
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/download-artifact@v4
         with:
-          name: extensions-${{ needs.resolve-channel.outputs.channel }}
           path: artifacts/
+          merge-multiple: true
 
       - name: Push to registry repo
         env:
           REGISTRY_PAT: ${{ secrets.REGISTRY_PAT }}
-          CHANNEL: ${{ needs.resolve-channel.outputs.channel }}
+          CHANNEL: ${{ needs.changes.outputs.channel }}
         run: |
           set -e
           git clone https://x-access-token:${REGISTRY_PAT}@github.com/rovehq/registry.git /tmp/registry
           COMMIT=$(git rev-parse --short HEAD)
-          mkdir -p "/tmp/registry/${CHANNEL}/extensions"
-          cp -r artifacts/registry/. "/tmp/registry/${CHANNEL}/extensions/"
+
+          # Wasm plugin bundles
+          if [ -d "artifacts/registry" ]; then
+            mkdir -p "/tmp/registry/${CHANNEL}/extensions"
+            cp -r artifacts/registry/. "/tmp/registry/${CHANNEL}/extensions/"
+          fi
+
+          # Native dylibs
+          if [ -d "artifacts/native" ]; then
+            mkdir -p "/tmp/registry/${CHANNEL}/native"
+            cp -r artifacts/native/. "/tmp/registry/${CHANNEL}/native/"
+          fi
+
           cd /tmp/registry
           git config user.name "rove-ci"
           git config user.email "ci@roveai.co"

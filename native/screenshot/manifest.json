@@ -1,0 +1,28 @@
+{
+  "id": "vision",
+  "name": "Vision (Screenshot)",
+  "version": "0.0.3",
+  "sdk_version": "0.1.0",
+  "description": "Local screenshot capture via OS-native tools (screencapture on macOS, scrot on Linux, PowerShell on Windows).",
+  "author": "Rove HQ",
+  "plugin_type": "Native",
+  "trust_tier": "Official",
+  "native_tool_entry": true,
+  "permissions": {
+    "filesystem": ["workspace/**"],
+    "network": [],
+    "memory_read": false,
+    "memory_write": false,
+    "tools": []
+  },
+  "tools": [
+    {
+      "name": "capture_screen",
+      "description": "Capture a screenshot and save it to a file.",
+      "parameters": {
+        "output_file": "String"
+      },
+      "risk_tier": 0
+    }
+  ]
+}

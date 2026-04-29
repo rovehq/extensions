@@ -1,0 +1,20 @@
+[package]
+name = "screenshot"
+version = "0.0.3"
+edition = "2021"
+authors = ["Rove HQ"]
+license = "BUSL-1.1"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+native-tool-entry = []
+
+[dependencies]
+sdk = { path = "../../../core/sdk" }
+anyhow = "1.0"
+serde_json = "1.0"
+tokio = { version = "1.35", features = ["full"] }
+tracing = "0.1"
